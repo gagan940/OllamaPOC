@@ -53,3 +53,224 @@
         </div>
     </lightning-card>
 </template>
+
+
+import { LightningElement, track } from 'lwc';
+import sendMessage from '@salesforce/apex/GeminiChatController.sendMessage';
+
+const BOT_NAME = 'OpenCode Assistant';
+const WELCOME =
+    'Hello! I am connected to your Salesforce CRM data. Ask me to analyze open pipeline stages, lead breakdown, or sales metrics.';
+
+// Escape all HTML first so model output can never inject markup
+function escapeHtml(s) {
+    return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+function inline(s) {
+    return s
+        .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+        .replace(/`([^`]+)`/g, '<code style="background:#f3f3f3;padding:0 4px;border-radius:3px">$1</code>');
+}
+
+function splitCells(row) {
+    return row.trim().replace(/^\|/, '').replace(/\|$/, '').split('|').map((c) => c.trim());
+}
+
+function renderTable(rows) {
+    const head = splitCells(rows[0]);
+    const aligns = splitCells(rows[1]).map((c) =>
+        c.endsWith(':') ? (c.startsWith(':') ? 'center' : 'right') : 'left'
+    );
+    const cell = 'border:1px solid #c9c9c9;padding:6px 8px;';
+    let html =
+        '<div style="overflow-x:auto"><table style="border-collapse:collapse;width:100%;margin:8px 0;font-size:0.8125rem">';
+    html += '<thead><tr>';
+    head.forEach((h, idx) => {
+        html += `<th style="${cell}background:#f3f3f3;text-align:${aligns[idx] || 'left'}">${inline(h)}</th>`;
+    });
+    html += '</tr></thead><tbody>';
+    rows.slice(2).forEach((r) => {
+        html += '<tr>';
+        splitCells(r).forEach((c, idx) => {
+            html += `<td style="${cell}text-align:${aligns[idx] || 'left'}">${inline(c)}</td>`;
+        });
+        html += '</tr>';
+    });
+    return html + '</tbody></table></div>';
+}
+
+function renderMarkdown(src) {
+    const lines = escapeHtml((src || '').replace(/\r/g, '')).split('\n');
+    let html = '';
+    let list = null;
+    let i = 0;
+    const closeList = () => {
+        if (list) {
+            html += `</${list}>`;
+            list = null;
+        }
+    };
+
+    while (i < lines.length) {
+        const t = lines[i].trim();
+        if (!t) {
+            closeList();
+            i++;
+            continue;
+        }
+        // Table: a "|" row followed by a separator row like |---|---:|
+        if (
+            t.startsWith('|') &&
+            i + 1 < lines.length &&
+            /^\s*\|?[\s:|-]+\|?\s*$/.test(lines[i + 1]) &&
+            lines[i + 1].includes('-')
+        ) {
+            closeList();
+            const rows = [t, lines[i + 1].trim()];
+            i += 2;
+            while (i < lines.length && lines[i].trim().startsWith('|')) {
+                rows.push(lines[i].trim());
+                i++;
+            }
+            html += renderTable(rows);
+            continue;
+        }
+        let m = t.match(/^(#{1,4})\s+(.*)$/);
+        if (m) {
+            closeList();
+            html += `<div style="font-weight:700;margin:12px 0 4px">${inline(m[2])}</div>`;
+            i++;
+            continue;
+        }
+        m = t.match(/^[-*•]\s+(.*)$/);
+        if (m) {
+            if (list !== 'ul') {
+                closeList();
+                html += '<ul style="margin:4px 0 4px 20px;list-style:disc">';
+                list = 'ul';
+            }
+            html += `<li style="margin:2px 0">${inline(m[1])}</li>`;
+            i++;
+            continue;
+        }
+        m = t.match(/^\d+[.)]\s+(.*)$/);
+        if (m) {
+            if (list !== 'ol') {
+                closeList();
+                html += '<ol style="margin:4px 0 4px 20px;list-style:decimal">';
+                list = 'ol';
+            }
+            html += `<li style="margin:2px 0">${inline(m[1])}</li>`;
+            i++;
+            continue;
+        }
+        closeList();
+        html += `<p style="margin:4px 0">${inline(t)}</p>`;
+        i++;
+    }
+    closeList();
+    return html;
+}
+
+export default class GeminiChatbot extends LightningElement {
+    @track messages = [
+        {
+            id: 1,
+            sender: BOT_NAME,
+            isBot: true,
+            text: WELCOME,
+            html: renderMarkdown(WELCOME),
+            containerClass: 'slds-chat-listitem slds-chat-listitem_inbound slds-m-bottom_small',
+            bubbleClass: 'slds-chat-message__body slds-theme_gray'
+        }
+    ];
+
+    userInput = '';
+    isLoading = false;
+    msgCounter = 2;
+    rendered = new WeakSet();
+
+    renderedCallback() {
+        this.template.querySelectorAll('.md-body').forEach((el) => {
+            if (this.rendered.has(el)) return;
+            const msg = this.messages.find((m) => String(m.id) === el.dataset.id);
+            if (msg) {
+                // eslint-disable-next-line @lwc/lwc/no-inner-html
+                el.innerHTML = msg.html;
+                this.rendered.add(el);
+            }
+        });
+    }
+
+    handleInputChange(event) {
+        this.userInput = event.target.value;
+    }
+
+    handleKeyUp(event) {
+        if (event.key === 'Enter' && !this.isLoading) {
+            this.handleSend();
+        }
+    }
+
+    async handleSend() {
+        if (!this.userInput || !this.userInput.trim() || this.isLoading) {
+            return;
+        }
+
+        const userText = this.userInput.trim();
+        this.userInput = '';
+
+        this.messages.push({
+            id: this.msgCounter++,
+            sender: 'You',
+            isBot: false,
+            text: userText,
+            containerClass: 'slds-chat-listitem slds-chat-listitem_outbound slds-m-bottom_small slds-text-align_right',
+            bubbleClass: 'slds-chat-message__body slds-theme_brand'
+        });
+
+        this.isLoading = true;
+        this.scrollToBottom();
+
+        try {
+            const aiResponse = await sendMessage({ message: userText });
+
+            this.messages.push({
+                id: this.msgCounter++,
+                sender: BOT_NAME,
+                isBot: true,
+                text: aiResponse,
+                html: renderMarkdown(aiResponse),
+                containerClass: 'slds-chat-listitem slds-chat-listitem_inbound slds-m-bottom_small',
+                bubbleClass: 'slds-chat-message__body slds-theme_gray'
+            });
+        } catch (error) {
+            let errorMsg = 'Failed to fetch AI response.';
+            if (error.body && error.body.message) {
+                errorMsg = error.body.message;
+            }
+
+            this.messages.push({
+                id: this.msgCounter++,
+                sender: 'Error',
+                isBot: false,
+                text: errorMsg,
+                containerClass: 'slds-chat-listitem slds-chat-listitem_inbound slds-m-bottom_small',
+                bubbleClass: 'slds-chat-message__body slds-theme_error'
+            });
+        } finally {
+            this.isLoading = false;
+            this.scrollToBottom();
+        }
+    }
+
+    scrollToBottom() {
+        setTimeout(() => {
+            const chatContainer = this.template.querySelector('.messages-area');
+            if (chatContainer) {
+                chatContainer.scrollTop = chatContainer.scrollHeight;
+            }
+        }, 100);
+    }
+}
