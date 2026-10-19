@@ -1,0 +1,143 @@
+public with sharing class GeminiChatController {
+
+    @AuraEnabled
+    public static String sendMessage(String message) {
+        if (String.isBlank(message)) {
+            throw fail('Message cannot be empty.');
+        }
+
+        String fullPrompt;
+        if (isGreeting(message)) {
+            fullPrompt = 'The user said hello. Respond politely in one or two sentences as a helpful Salesforce Assistant.';
+        } else {
+            String sfContext = getSalesforceDataContext();
+            fullPrompt = 'CURRENT SALESFORCE DATA METRICS:\n' + sfContext +
+                         '\n\nUSER QUESTION: ' + message;
+        }
+
+        String sessionId;
+        try {
+            // 1. Create a session on the OpenCode server
+            Map<String, Object> session = (Map<String, Object>)
+                JSON.deserializeUntyped(callOpenCode('POST', '/session', '{}'));
+            sessionId = (String) session.get('id');
+
+            // 2. Send the message
+            Map<String, Object> requestBody = new Map<String, Object>{
+                'parts' => new List<Object>{
+                    new Map<String, Object>{
+                        'type' => 'text',
+                        'text' => 'You are an expert Salesforce Data Analyst. Answer ONLY from the ' +
+                                  'Salesforce metrics below. Do not read files, run commands or use tools.\n\n' +
+                                  'FORMAT RULES: Use real line breaks. Start with one summary sentence. ' +
+                                  'Then one markdown table (each row on its own line). ' +
+                                  'Then a heading "Key insights" followed by at most 4 short bullet points. ' +
+                                  'Then a heading "Recommendation" with one sentence. ' +
+                                  'Keep it under 200 words. No HTML.\n\n' +
+                                  fullPrompt
+                    }
+                }
+            };
+            Map<String, Object> reply = (Map<String, Object>) JSON.deserializeUntyped(
+                callOpenCode('POST', '/session/' + sessionId + '/message', JSON.serialize(requestBody)));
+
+            // 3. Collect the text parts of the reply
+            String answer = '';
+            List<Object> parts = (List<Object>) reply.get('parts');
+            if (parts != null) {
+                for (Object p : parts) {
+                    Map<String, Object> part = (Map<String, Object>) p;
+                    if (part.get('type') == 'text' && part.get('text') != null) {
+                        answer += (String) part.get('text');
+                    }
+                }
+            }
+
+            if (String.isBlank(answer)) {
+                Map<String, Object> info = (Map<String, Object>) reply.get('info');
+                String detail = (info != null && info.get('error') != null)
+                    ? JSON.serialize(info.get('error'))
+                    : (info != null ? JSON.serialize(info) : 'no info');
+                throw fail('No text in reply. ' + detail.abbreviate(400));
+            }
+            return answer;
+
+        } catch (AuraHandledException e) {
+            throw e;
+        } catch (System.CalloutException e) {
+            throw fail('Callout timed out or unreachable. Verify the OpenCode server and ngrok tunnel are running. ' + e.getMessage());
+        } catch (Exception e) {
+            throw fail('Error calling OpenCode: ' + e.getMessage());
+        } finally {
+            // Best-effort cleanup so sessions do not pile up
+            if (sessionId != null) {
+                try { callOpenCode('DELETE', '/session/' + sessionId, null); } catch (Exception ignore) {}
+            }
+        }
+    }
+
+    private static String callOpenCode(String method, String path, String body) {
+        HttpRequest req = new HttpRequest();
+        req.setEndpoint('callout:OpenCode' + path);
+        req.setMethod(method);
+        req.setHeader('Content-Type', 'application/json');
+        req.setHeader('ngrok-skip-browser-warning', 'true');
+        req.setTimeout(120000);
+        if (body != null) req.setBody(body);
+
+        HttpResponse res = new Http().send(req);
+        if (res.getStatusCode() >= 300) {
+            throw fail('OpenCode API Error (' + res.getStatusCode() + '): ' +
+                       res.getBody().abbreviate(300));
+        }
+        return res.getBody();
+    }
+
+    private static AuraHandledException fail(String msg) {
+        AuraHandledException e = new AuraHandledException(msg);
+        e.setMessage(msg);
+        return e;
+    }
+
+    private static Boolean isGreeting(String msg) {
+        Set<String> greetings = new Set<String>{'hi', 'hello', 'hey', 'greetings', 'help'};
+        return greetings.contains(msg.trim().toLowerCase());
+    }
+
+    private static String getSalesforceDataContext() {
+        List<String> contextLines = new List<String>();
+
+        AggregateResult[] oppStats = [
+            SELECT StageName, COUNT(Id) oppCount, SUM(Amount) totalAmount
+            FROM Opportunity
+            WHERE IsClosed = false
+            WITH USER_MODE
+            GROUP BY StageName
+        ];
+
+        contextLines.add('- OPEN OPPORTUNITIES PIPELINE:');
+        for (AggregateResult ar : oppStats) {
+            Object amt = ar.get('totalAmount');
+            contextLines.add('  * Stage: ' + ar.get('StageName') +
+                             ' | Count: ' + ar.get('oppCount') +
+                             ' | Total Value: $' + (amt != null ? amt : 0));
+        }
+
+        AggregateResult[] leadStats = [
+            SELECT Status, COUNT(Id) leadCount
+            FROM Lead
+            WHERE IsConverted = false
+            WITH USER_MODE
+            GROUP BY Status
+        ];
+
+        contextLines.add('- UNCONVERTED LEADS BY STATUS:');
+        for (AggregateResult ar : leadStats) {
+            contextLines.add('  * Status: ' + ar.get('Status') + ' | Count: ' + ar.get('leadCount'));
+        }
+
+        contextLines.add('- USER CONTEXT: User ' + UserInfo.getName());
+
+        return String.join(contextLines, '\n');
+    }
+}
