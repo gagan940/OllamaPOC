@@ -1,0 +1,55 @@
+<template>
+    <lightning-card title="Salesforce AI Analytics Assistant" icon-name="utility:chat">
+        <div class="slds-p-around_medium chat-container">
+            <!-- Message List -->
+            <div class="messages-area slds-scrollable_y">
+                <template for:each={messages} for:item="msg">
+                    <div key={msg.id} class={msg.containerClass}>
+                        <div class={msg.bubbleClass}>
+                            <strong>{msg.sender}:</strong>
+                            <template if:true={msg.isBot}>
+                                <div class="md-body" lwc:dom="manual" data-id={msg.id}></div>
+                            </template>
+                            <template if:false={msg.isBot}>
+                                <p class="slds-whitespace_pre-wrap">{msg.text}</p>
+                            </template>
+                        </div>
+                    </div>
+                </template>
+
+                <!-- Spinner -->
+                <template if:true={isLoading}>
+                    <div class="slds-p-around_small slds-text-align_center">
+                        <lightning-spinner alternative-text="Analyzing Salesforce Data..." size="small"></lightning-spinner>
+                        <span class="slds-text-color_weak slds-m-top_x-small">Analyzing Salesforce Data...</span>
+                    </div>
+                </template>
+            </div>
+
+            <!-- Input Controls -->
+            <div class="slds-m-top_medium input-area">
+                <lightning-layout vertical-align="center">
+                    <lightning-layout-item flexibility="grow">
+                        <lightning-input
+                            type="text"
+                            variant="label-hidden"
+                            placeholder="Ask about pipeline, lead breakdown, or performance..."
+                            value={userInput}
+                            onchange={handleInputChange}
+                            onkeyup={handleKeyUp}>
+                        </lightning-input>
+                    </lightning-layout-item>
+                    <lightning-layout-item class="slds-m-left_x-small">
+                        <lightning-button
+                            variant="brand"
+                            label="Send"
+                            icon-name="utility:send"
+                            onclick={handleSend}
+                            disabled={isLoading}>
+                        </lightning-button>
+                    </lightning-layout-item>
+                </lightning-layout>
+            </div>
+        </div>
+    </lightning-card>
+</template>
